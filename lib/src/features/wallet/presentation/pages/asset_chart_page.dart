@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:intl/intl.dart';
+import 'dart:ui' show FontFeature;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../../../../utils/I10n.dart';
@@ -319,40 +320,65 @@ class _AssetChartPageState extends State<AssetChartPage> {
 
   Widget _buildHeader() {
     final loc = L10n.of(context);
+
     final String priceText = _hoverPrice != null
         ? _formatCompact(_hoverPrice!)
         : _formatCompact(widget.asset.price, fractionDigits: 4);
 
-    String timeText;
-    if (_hoverTime != null) {
-      timeText = DateFormat(_selectedPeriod == '1H' ? 'HH:mm:ss' : 'MM-dd HH:mm')
-          .format(_hoverTime!);
-    } else {
-      timeText = '$_selectedPeriod · ${loc.t('market_price')}';
-    }
+    final String timeText = _hoverTime != null
+        ? DateFormat(_selectedPeriod == '1H' ? 'HH:mm:ss' : 'MM-dd HH:mm')
+        .format(_hoverTime!)
+        : '$_selectedPeriod · ${loc.t('market_price')}';
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 20),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('\$$priceText',
-                style: const TextStyle(
-                    fontSize: 32,
-                    fontWeight: FontWeight.bold,
-                    color: AppColors.button)),
-            const SizedBox(height: 4),
-            Text(timeText,
-                style: const TextStyle(
-                    color: AppColors.textSecondary, fontSize: 14)),
-          ]),
-          if (widget.asset.logo != null)
-            Hero(
-              tag: 'asset_logo',
-              child: Image.asset(widget.asset.logo!, width: 48, height: 48),
+      child: SizedBox(
+        height: 70, // 固定 Header 高度，避免因文字高度/行距变化引起跳动
+        child: Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    '\$$priceText',
+                    maxLines: 1,
+                    overflow: TextOverflow.clip,
+                    style: const TextStyle(
+                      fontSize: 32,
+                      fontWeight: FontWeight.bold,
+                      color: AppColors.button,
+                      fontFeatures: [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    timeText,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: AppColors.textSecondary,
+                      fontSize: 14,
+                      fontFeatures: [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ],
+              ),
             ),
-        ],
+            const SizedBox(width: 12),
+            SizedBox(
+              width: 48,
+              height: 48,
+              child: (widget.asset.logo != null)
+                  ? Hero(
+                tag: 'asset_logo',
+                child: Image.asset(widget.asset.logo!, width: 48, height: 48),
+              )
+                  : const SizedBox.shrink(),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -420,44 +446,48 @@ class _AssetChartPageState extends State<AssetChartPage> {
 
   Widget _buildFunctionalArea() {
     final loc = L10n.of(context);
-    return ListView(
+
+    return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 20),
-      children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceAround,
-          children: ['1H', '1D', '1W', '1M', '1Y'].map((range) {
-            final isSelected = _selectedPeriod == range;
-            return GestureDetector(
-              onTap: () => _loadData(range),
-              child: Container(
-                padding:
-                const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                decoration: BoxDecoration(
-                  color: isSelected
-                      ? AppColors.button.withOpacity(0.15)
-                      : Colors.transparent,
-                  borderRadius: AppRadii.pill,
-                ),
-                child: Text(
-                  range,
-                  style: TextStyle(
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceAround,
+            children: ['1H', '1D', '1W', '1M', '1Y'].map((range) {
+              final isSelected = _selectedPeriod == range;
+              return GestureDetector(
+                onTap: () => _loadData(range),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  decoration: BoxDecoration(
                     color: isSelected
-                        ? AppColors.button
-                        : AppColors.textSecondary,
-                    fontWeight:
-                    isSelected ? FontWeight.bold : FontWeight.normal,
+                        ? AppColors.button.withOpacity(0.15)
+                        : Colors.transparent,
+                    borderRadius: AppRadii.pill,
+                  ),
+                  child: Text(
+                    range,
+                    style: TextStyle(
+                      color: isSelected ? AppColors.button : AppColors.textSecondary,
+                      fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                    ),
                   ),
                 ),
-              ),
-            );
-          }).toList(),
-        ),
-        const SizedBox(height: 24),
-        _buildInfoTile(loc.t('availableBalance'),
-            '${_formatCompact(widget.asset.balance, fractionDigits: 6)} SCASH'),
-        _buildInfoTile(loc.t('estimated_value'),
-            '\$${_formatCompact(widget.asset.price * widget.asset.balance, fractionDigits: 4)}'),
-      ],
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 24),
+          _buildInfoTile(
+            loc.t('availableBalance'),
+            '${_formatCompact(widget.asset.balance, fractionDigits: 6)} SCASH',
+          ),
+          _buildInfoTile(
+            loc.t('estimated_value'),
+            '\$${_formatCompact(widget.asset.price * widget.asset.balance, fractionDigits: 4)}',
+          ),
+          const Spacer(),
+        ],
+      ),
     );
   }
 
