@@ -1,0 +1,8 @@
+# 告诉 FRB 你的 Rust 入口在哪里
+rust_input: "crate::api"
+
+# 告诉 FRB 生成的 Dart 代码放哪里 (相对于当前目录)
+dart_output: "../../bridge_generated/"
+
+# 如果你使用的是 Rust 模块化结构，可以开启这个
+rust_root: "."
