@@ -39,6 +39,8 @@ class _TransactionListPageState extends State<TransactionListPage>
 
   static const String _cachePrefix = 'cache_txs_v2_';
 
+  DateTime? _lastResumeAt;
+
   @override
   void initState() {
     super.initState();
@@ -61,8 +63,23 @@ class _TransactionListPageState extends State<TransactionListPage>
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
+      final now = DateTime.now();
+      if (_lastResumeAt != null &&
+          now.difference(_lastResumeAt!) < const Duration(seconds: 2)) {
+        return;
+      }
+      _lastResumeAt = now;
+
       _startPolling();
-      _fetchTransactions(showLoading: false);
+
+      Future.microtask(() async {
+        final wallet = await _storageService.getCurrentWallet();
+        final addr = wallet?.address;
+        if (addr != null && addr.isNotEmpty) {
+          await _loadLocalCache(addr);
+        }
+        await _fetchTransactions(showLoading: false, allowEmptyOverwrite: false);
+      });
     } else if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.inactive ||
         state == AppLifecycleState.detached) {
@@ -73,8 +90,10 @@ class _TransactionListPageState extends State<TransactionListPage>
   void _startPolling() {
     _pollingTimer?.cancel();
     _pollingTimer = Timer.periodic(const Duration(seconds: 20), (_) {
-      if (mounted && !_isLoading) {
-        _fetchTransactions(showLoading: false);
+      if (!mounted) return;
+      // 轮询时不允许空数据覆盖旧列表
+      if (!_isLoading) {
+        _fetchTransactions(showLoading: false, allowEmptyOverwrite: false);
       }
     });
   }
@@ -88,7 +107,7 @@ class _TransactionListPageState extends State<TransactionListPage>
   void _setupEventListeners() {
     _refreshSubscription =
         EventBus().on<RefreshWalletEvent>().listen((event) {
-          _fetchTransactions(showLoading: false);
+          _fetchTransactions(showLoading: false, allowEmptyOverwrite: false);
         });
   }
 
@@ -101,11 +120,9 @@ class _TransactionListPageState extends State<TransactionListPage>
       return;
     }
 
-    // 秒开：先读缓存
     await _loadLocalCache(wallet.address);
 
-    // 后台刷新
-    _fetchTransactions(showLoading: _allTransactions.isEmpty);
+    _fetchTransactions(showLoading: _allTransactions.isEmpty, allowEmptyOverwrite: true);
   }
 
   Future<void> _loadLocalCache(String address) async {
@@ -135,8 +152,7 @@ class _TransactionListPageState extends State<TransactionListPage>
     try {
       final prefs = await SharedPreferences.getInstance();
       final limited = txs.take(50).toList();
-      final encoded =
-      jsonEncode(limited.map((t) => t.toJson()).toList());
+      final encoded = jsonEncode(limited.map((t) => t.toJson()).toList());
       await prefs.setString('$_cachePrefix$address', encoded);
     } catch (e) {
       debugPrint('保存交易缓存失败: $e');
@@ -144,8 +160,10 @@ class _TransactionListPageState extends State<TransactionListPage>
   }
 
   // --- 核心刷新逻辑（防竞态 + 去重 + 排序） ---
-
-  Future<void> _fetchTransactions({bool showLoading = false}) async {
+  Future<void> _fetchTransactions({
+    bool showLoading = false,
+    required bool allowEmptyOverwrite,
+  }) async {
     final int token = ++_refreshToken;
 
     if (showLoading && mounted) {
@@ -155,12 +173,10 @@ class _TransactionListPageState extends State<TransactionListPage>
     try {
       final wallet = await _storageService.getCurrentWallet();
       final address = wallet?.address;
+
       if (address == null || address.isEmpty) {
         if (mounted) {
-          setState(() {
-            _allTransactions = [];
-            _isLoading = false;
-          });
+          setState(() => _isLoading = false);
         }
         return;
       }
@@ -171,11 +187,9 @@ class _TransactionListPageState extends State<TransactionListPage>
 
       if (!mounted || token != _refreshToken) return;
 
-      // 二次校验：当前钱包是否仍一致
       final current = await _storageService.getCurrentWallet();
       if (current?.address != requestAddr) return;
 
-      // 去重（按 txHash）
       final Map<String, Transaction> dedup = {};
       for (final t in txs) {
         if (t.isValid) {
@@ -185,7 +199,6 @@ class _TransactionListPageState extends State<TransactionListPage>
 
       final List<Transaction> validTxs = dedup.values.toList()
         ..sort((a, b) {
-          // pending / 无时间在最前，其余按时间倒序
           final at = a.timestamp;
           final bt = b.timestamp;
           if (at == null && bt == null) return 0;
@@ -194,13 +207,21 @@ class _TransactionListPageState extends State<TransactionListPage>
           return bt.compareTo(at);
         });
 
-      setState(() {
-        _allTransactions = validTxs;
-        _isLoading = false;
-      });
+      final bool shouldOverwrite =
+          allowEmptyOverwrite || validTxs.isNotEmpty || _allTransactions.isEmpty;
 
-      // 不阻塞 UI
-      unawaited(_saveToCache(requestAddr, validTxs));
+      if (mounted) {
+        setState(() {
+          if (shouldOverwrite) {
+            _allTransactions = validTxs;
+          }
+          _isLoading = false;
+        });
+      }
+
+      if (shouldOverwrite && validTxs.isNotEmpty) {
+        unawaited(_saveToCache(requestAddr, validTxs));
+      }
     } catch (e) {
       if (mounted) setState(() => _isLoading = false);
     }
@@ -209,7 +230,7 @@ class _TransactionListPageState extends State<TransactionListPage>
   // --- UI 逻辑 ---
 
   Future<void> _onPullRefresh() async {
-    await _fetchTransactions(showLoading: false);
+    await _fetchTransactions(showLoading: false, allowEmptyOverwrite: true);
   }
 
   List<Transaction> get _filteredTransactions {
@@ -269,12 +290,10 @@ class _TransactionListPageState extends State<TransactionListPage>
                 refreshTriggerPullDistance, refreshIndicatorExtent) {
               return Center(
                 child: Opacity(
-                  opacity:
-                  (pulledExtent / refreshTriggerPullDistance)
+                  opacity: (pulledExtent / refreshTriggerPullDistance)
                       .clamp(0.0, 1.0),
                   child: const CupertinoActivityIndicator(
-                      radius: 10,
-                      color: AppColors.textSecondary),
+                      radius: 10, color: AppColors.textSecondary),
                 ),
               );
             },
@@ -294,7 +313,7 @@ class _TransactionListPageState extends State<TransactionListPage>
     );
   }
 
-  // --- 以下 UI 构建函数与你原版一致（未再改动） ---
+  // --- 以下 UI 构建函数与你原版一致 ---
 
   Widget _buildFilterBar(L10n loc) {
     return Padding(
@@ -318,24 +337,22 @@ class _TransactionListPageState extends State<TransactionListPage>
       },
       child: Container(
         margin: const EdgeInsets.only(right: 8),
-        padding:
-        const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
         decoration: BoxDecoration(
           color: selected ? AppColors.button : AppColors.card,
           borderRadius: AppRadii.pill,
           border: Border.all(
-              color: selected
-                  ? Colors.transparent
-                  : Colors.white.withOpacity(0.05)),
+            color: selected
+                ? Colors.transparent
+                : Colors.white.withOpacity(0.05),
+          ),
         ),
         child: Text(
           label,
           style: TextStyle(
-            color:
-            selected ? Colors.white : AppColors.textSecondary,
+            color: selected ? Colors.white : AppColors.textSecondary,
             fontSize: 14,
-            fontWeight:
-            selected ? FontWeight.bold : FontWeight.w500,
+            fontWeight: selected ? FontWeight.bold : FontWeight.w500,
           ),
         ),
       ),
@@ -349,27 +366,28 @@ class _TransactionListPageState extends State<TransactionListPage>
         SliverFillRemaining(
           hasScrollBody: false,
           child: Center(
-            child: Text(loc.t('no_transactions'),
-                style: const TextStyle(
-                    color: AppColors.textSecondary, fontSize: 14)),
+            child: Text(
+              loc.t('no_transactions'),
+              style: const TextStyle(
+                color: AppColors.textSecondary,
+                fontSize: 14,
+              ),
+            ),
           ),
         ),
       ];
     }
 
     final Map<String, List<Transaction>> grouped = {};
-    final locale =
-    Localizations.localeOf(context).toLanguageTag();
+    final locale = Localizations.localeOf(context).toLanguageTag();
     final isZh = locale.startsWith('zh');
 
     for (final tx in txs) {
       final key = tx.timestamp == null || tx.status == 'pending'
           ? loc.t('pending')
           : (isZh
-          ? DateFormat('yyyy/MM/dd', locale)
-          .format(tx.timestamp!)
-          : DateFormat('dd MMMM yyyy', locale)
-          .format(tx.timestamp!));
+          ? DateFormat('yyyy/MM/dd', locale).format(tx.timestamp!)
+          : DateFormat('dd MMMM yyyy', locale).format(tx.timestamp!));
       grouped.putIfAbsent(key, () => []).add(tx);
     }
 
@@ -387,8 +405,8 @@ class _TransactionListPageState extends State<TransactionListPage>
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Padding(
-                    padding: const EdgeInsets.only(
-                        top: 24, bottom: 12, left: 4),
+                    padding:
+                    const EdgeInsets.only(top: 24, bottom: 12, left: 4),
                     child: Text(
                       groupKey.toUpperCase(),
                       style: const TextStyle(
@@ -399,8 +417,7 @@ class _TransactionListPageState extends State<TransactionListPage>
                       ),
                     ),
                   ),
-                  ...items.map(
-                          (tx) => _buildTransactionCard(tx, loc)),
+                  ...items.map((tx) => _buildTransactionCard(tx, loc)),
                 ],
               );
             },
@@ -412,22 +429,17 @@ class _TransactionListPageState extends State<TransactionListPage>
   }
 
   Widget _buildTransactionCard(Transaction tx, L10n loc) {
-    final isPending =
-        tx.status == 'pending' || tx.confirmations <= 0;
+    final isPending = tx.status == 'pending' || tx.confirmations <= 0;
     final isSent = tx.isSent;
     final mainColor = isPending
         ? Colors.orange
-        : (isSent
-        ? const Color(0xFFFF5252)
-        : const Color(0xFF00E676));
+        : (isSent ? const Color(0xFFFF5252) : const Color(0xFF00E676));
 
     final title = isPending
         ? loc.t('confirmation_in_progress')
         : (isSent ? loc.t('sent') : loc.t('receive'));
-    final icon =
-    isSent ? Icons.arrow_upward : Icons.arrow_downward;
-    final displayAmount =
-        '${isSent ? '-' : '+'}${tx.amountText} SCASH';
+    final icon = isSent ? Icons.arrow_upward : Icons.arrow_downward;
+    final displayAmount = '${isSent ? '-' : '+'}${tx.amountText} SCASH';
 
     return Container(
       key: ValueKey(tx.txHash),
@@ -437,24 +449,27 @@ class _TransactionListPageState extends State<TransactionListPage>
         color: AppColors.card,
         borderRadius: AppRadii.r16,
         border: Border.all(
-            color: isPending
-                ? Colors.orange.withOpacity(0.3)
-                : Colors.white.withOpacity(0.05)),
+          color: isPending
+              ? Colors.orange.withOpacity(0.3)
+              : Colors.white.withOpacity(0.05),
+        ),
       ),
       child: Row(
         children: [
           Container(
             padding: const EdgeInsets.all(10),
             decoration: BoxDecoration(
-                color: mainColor.withOpacity(0.1),
-                shape: BoxShape.circle),
+              color: mainColor.withOpacity(0.1),
+              shape: BoxShape.circle,
+            ),
             child: isPending
                 ? const SizedBox(
               width: 20,
               height: 20,
               child: CircularProgressIndicator(
-                  strokeWidth: 2,
-                  color: Colors.orange),
+                strokeWidth: 2,
+                color: Colors.orange,
+              ),
             )
                 : Icon(icon, color: mainColor, size: 20),
           ),
@@ -463,36 +478,45 @@ class _TransactionListPageState extends State<TransactionListPage>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(title,
-                    style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 15,
-                        color: AppColors.textPrimary)),
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 15,
+                    color: AppColors.textPrimary,
+                  ),
+                ),
                 const SizedBox(height: 2),
-                Text(_shortenHash(tx.txHash),
-                    style: const TextStyle(
-                        color: AppColors.textSecondary,
-                        fontSize: 12)),
+                Text(
+                  _shortenHash(tx.txHash),
+                  style: const TextStyle(
+                    color: AppColors.textSecondary,
+                    fontSize: 12,
+                  ),
+                ),
               ],
             ),
           ),
           Column(
             crossAxisAlignment: CrossAxisAlignment.end,
             children: [
-              Text(displayAmount,
-                  style: TextStyle(
-                      color: mainColor,
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold)),
+              Text(
+                displayAmount,
+                style: TextStyle(
+                  color: mainColor,
+                  fontSize: 16,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
               const SizedBox(height: 2),
               Text(
                 isPending
                     ? loc.t('pending')
                     : '${tx.confirmations} ${loc.t('confirmations_label')}',
                 style: TextStyle(
-                    color:
-                    isPending ? Colors.orange : AppColors.textSecondary,
-                    fontSize: 10),
+                  color: isPending ? Colors.orange : AppColors.textSecondary,
+                  fontSize: 10,
+                ),
               ),
             ],
           ),

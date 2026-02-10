@@ -54,14 +54,13 @@ class _WalletListPageState extends State<WalletListPage>
 
   int _selectedWalletIndex = 0;
 
-  /// 用于刷新竞态控制（切换钱包/多次刷新时防止旧请求回写）
   int _refreshToken = 0;
 
   double _totalUSD = 0;
   double _totalSCash = 0;
   bool _didPrecacheLogo = false;
 
-  // 仅缓存 balance/usd；price 交给 WalletService.getScashPrice（全局缓存）
+  // 缓存 balance/usd/price
   static const String _cachePrefix = 'cache_v1_';
 
   DateTime? _lastResumeRefreshAt;
@@ -77,7 +76,6 @@ class _WalletListPageState extends State<WalletListPage>
   }
 
   void _setupEventListeners() {
-    // 发送成功/其他页面触发刷新：只做后端刷新，不做任何余额扣减
     _refreshSubscription = EventBus().on<RefreshWalletEvent>().listen((event) {
       if (!mounted) return;
       _refreshAllData(showLoading: false, silent: true);
@@ -95,7 +93,6 @@ class _WalletListPageState extends State<WalletListPage>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state != AppLifecycleState.resumed) return;
 
-    // 防抖：避免某些机型短时间多次触发 resumed
     final now = DateTime.now();
     if (_lastResumeRefreshAt != null &&
         now.difference(_lastResumeRefreshAt!) < const Duration(seconds: 2)) {
@@ -103,7 +100,6 @@ class _WalletListPageState extends State<WalletListPage>
     }
     _lastResumeRefreshAt = now;
 
-    // 串行：先缓存兜底展示，再静默刷新，避免“刷新完又被缓存覆盖”
     Future.microtask(() async {
       await _loadLocalCache();
       await _refreshAllData(showLoading: false, silent: true);
@@ -153,10 +149,7 @@ class _WalletListPageState extends State<WalletListPage>
       currentWallet = updatedWallets[safeIndex];
     });
 
-    // 立即加载本地缓存（秒开显示数据）
     await _loadLocalCache();
-
-    // 后台静默刷新最新数据（以 /balance 与 getScashPrice 为准）
     _refreshAllData(showLoading: _shouldShowLoadingOnInit(), silent: true);
   }
 
@@ -173,24 +166,33 @@ class _WalletListPageState extends State<WalletListPage>
 
     final cachedScash = prefs.getDouble('${_cachePrefix}bal_$addr') ?? 0.0;
     final cachedUsd = prefs.getDouble('${_cachePrefix}usd_$addr') ?? 0.0;
+    final cachedPrice = prefs.getDouble('${_cachePrefix}price_$addr') ?? 0.0;
 
-    final hasAnyCache = cachedScash > 0 || cachedUsd > 0;
+    final hasAnyCache = cachedScash > 0 || cachedUsd > 0 || cachedPrice > 0;
     if (!mounted || !hasAnyCache) return;
 
-    final double currentPrice = assets.isNotEmpty ? assets[0].price : 0.0;
+    double effectivePrice = cachedPrice;
+    if (effectivePrice <= 0 && cachedScash > 0 && cachedUsd > 0) {
+      effectivePrice = cachedUsd / cachedScash;
+    }
+    if (effectivePrice <= 0) {
+      final double prevPrice = assets.isNotEmpty ? assets[0].price : 0.0;
+      effectivePrice = prevPrice;
+    }
+
     final double effectiveUsd = cachedUsd > 0
         ? cachedUsd
-        : (currentPrice > 0 ? cachedScash * currentPrice : _totalUSD);
+        : (effectivePrice > 0 ? cachedScash * effectivePrice : _totalUSD);
 
     setState(() {
-      if (cachedScash >= 0) _totalSCash = cachedScash;
-      if (effectiveUsd >= 0) _totalUSD = effectiveUsd;
+      _totalSCash = cachedScash;
+      if (effectiveUsd > 0) _totalUSD = effectiveUsd;
 
       assets = [
         Asset(
           symbol: 'Scash',
           balance: cachedScash,
-          price: currentPrice,
+          price: effectivePrice,
           logo: 'assets/images/scash-logo.png',
         ),
       ];
@@ -200,6 +202,7 @@ class _WalletListPageState extends State<WalletListPage>
   Future<void> _saveToCache({
     required double bal,
     double? usd,
+    double? price,
   }) async {
     if (currentWallet == null) return;
     final prefs = await SharedPreferences.getInstance();
@@ -210,6 +213,11 @@ class _WalletListPageState extends State<WalletListPage>
     // usd 只有有效时才写，避免把缓存污染成 0
     if (usd != null && usd > 0) {
       await prefs.setDouble('${_cachePrefix}usd_$addr', usd);
+    }
+
+    // price 只有有效时才写
+    if (price != null && price > 0) {
+      await prefs.setDouble('${_cachePrefix}price_$addr', price);
     }
   }
 
@@ -223,13 +231,12 @@ class _WalletListPageState extends State<WalletListPage>
       return;
     }
 
-    final String addr = wallet.address; // 固化地址（防切换竞态）
+    final String addr = wallet.address;
     final int requestToken = ++_refreshToken;
 
     if (showLoading && mounted) setState(() => _isLoading = true);
 
     try {
-      // 余额必须尽量更新；价格失败不应阻断余额更新
       final balanceFuture = walletService.getBalance(addr);
       final priceFuture = walletService
           .getScashPrice()
@@ -281,6 +288,7 @@ class _WalletListPageState extends State<WalletListPage>
       await _saveToCache(
         bal: bal,
         usd: hasValidPrice ? usd : null,
+        price: hasValidPrice ? effectivePrice : null,
       );
     } catch (e) {
       if (mounted) {
@@ -356,8 +364,8 @@ class _WalletListPageState extends State<WalletListPage>
       title: _buildHeaderWalletButton(),
       actions: [
         IconButton(
-          icon: const Icon(Icons.settings_outlined,
-              color: AppColors.textPrimary),
+          icon:
+          const Icon(Icons.settings_outlined, color: AppColors.textPrimary),
           onPressed: () async {
             final result = await Navigator.push<bool>(
               context,
@@ -608,7 +616,6 @@ class _WalletListPageState extends State<WalletListPage>
   void _switchWallet(int index) async {
     HapticFeedback.mediumImpact();
 
-    // 立刻失效所有在途请求，避免旧钱包刷新回写 UI
     _refreshToken++;
 
     setState(() {
